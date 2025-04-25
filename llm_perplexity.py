@@ -5,18 +5,24 @@ from llm.utils import (
 )
 from openai import OpenAI
 from pydantic import Field, field_validator, model_validator
-from typing import Optional, List
+from typing import Optional, List, Dict
 
+# Model capabilities
+MODEL_CAPABILITIES = {
+    "sonar-pro": {"web_search": False},
+    "sonar": {"web_search": False},
+    "sonar-pro-online": {"web_search": True},
+    "sonar-deep-research": {"web_search": False},
+    "sonar-reasoning-pro": {"web_search": False},
+    "sonar-reasoning": {"web_search": False},
+    "r1-1776": {"web_search": False}
+}
 
 @llm.hookimpl
 def register_models(register):
     # https://docs.perplexity.ai/guides/model-cards
-    register(Perplexity("sonar-deep-research"))
-    register(Perplexity("sonar-reasoning-pro"))
-    register(Perplexity("sonar-reasoning"))
-    register(Perplexity("sonar-pro"))
-    register(Perplexity("sonar"))
-    register(Perplexity("r1-1776"))
+    for model_id, capabilities in MODEL_CAPABILITIES.items():
+        register(Perplexity(model_id, capabilities))
 
 class PerplexityOptions(llm.Options):
     max_tokens: Optional[int] = Field(
@@ -53,6 +59,26 @@ class PerplexityOptions(llm.Options):
         description="A multiplicative penalty greater than 0. Values greater than 1.0 penalize new tokens based on their existing frequency in the text so far, decreasing the model's likelihood to repeat the same line verbatim. A value of 1.0 means no penalty. Incompatible with 'presence_penalty'",
         default=None,
     )
+    
+    search_recency_filter: Optional[str] = Field(
+        description="Filter search results by time period. Options include 'day', 'week', 'month', 'hour', or 'none'. Only applicable for online models.",
+        default=None,
+    )
+    
+    search_domain_filter: Optional[str] = Field(
+        description="Filter search results by domain. Provide a comma-separated list of domains to include. Only applicable for online models.",
+        default=None,
+    )
+    
+    return_related_questions: Optional[bool] = Field(
+        description="Whether to return related questions in the response.",
+        default=False,
+    )
+    
+    image_path: Optional[str] = Field(
+        description="Path to an image file to include in the request. The image will be encoded as base64 and sent along with the text prompt.",
+        default=None,
+    )
 
     @field_validator("temperature")
     @classmethod
@@ -75,6 +101,22 @@ class PerplexityOptions(llm.Options):
             raise ValueError("top_k must be in range 0-2048")
         return top_k
 
+    @field_validator("search_recency_filter")
+    @classmethod
+    def validate_search_recency_filter(cls, recency_filter):
+        if recency_filter is not None and recency_filter not in ["day", "week", "month", "hour", "none"]:
+            raise ValueError("search_recency_filter must be one of: 'day', 'week', 'month', 'hour', or 'none'")
+        return recency_filter
+
+    @field_validator("search_domain_filter")
+    @classmethod
+    def validate_search_domain_filter(cls, domain_filter):
+        if domain_filter is not None:
+            domains = [d.strip() for d in domain_filter.split(",")]
+            if not all(d and "." in d for d in domains):
+                raise ValueError("search_domain_filter must be a comma-separated list of valid domains")
+        return domain_filter
+
     @model_validator(mode="after")
     def validate_temperature_top_p(self):
         if self.temperature != 1.0 and self.top_p is not None:
@@ -95,8 +137,9 @@ class Perplexity(llm.Model):
             default=False,
         )
 
-    def __init__(self, model_id):
+    def __init__(self, model_id, capabilities: Optional[Dict] = None):
         self.model_id = model_id
+        self.capabilities = capabilities or {}
 
     @staticmethod 
     def combine_chunks(chunks: List) -> dict:
@@ -110,10 +153,11 @@ class Perplexity(llm.Model):
         citations = {}
 
         for item in chunks:
-            if item.usage:
-                usage = item.usage.dict()
+            if hasattr(item, "usage") and item.usage:
+                usage = item.usage.model_dump()
                 
-            if item.citations:
+            if hasattr(item, "citations") and item.citations:
+                # Store citations for later processing
                 citations = item.citations
 
             for choice in item.choices:
@@ -168,7 +212,46 @@ class Perplexity(llm.Model):
                         {"role": "assistant", "content": response.text()},
                     ]
                 )
-        messages.append({"role": "user", "content": prompt.prompt})
+        
+        # Handle multi-modal input (text + image)
+        if prompt.options.image_path:
+            import base64
+            import os
+            import mimetypes
+
+            # Get mime type based on file extension
+            image_path = prompt.options.image_path
+            mime_type, _ = mimetypes.guess_type(image_path)
+            if not mime_type or not mime_type.startswith('image/'):
+                mime_type = 'image/png'  # Default if we can't determine
+            
+            # Read and encode the image
+            try:
+                with open(image_path, 'rb') as img_file:
+                    encoded_image = base64.b64encode(img_file.read()).decode('utf-8')
+                    
+                # Create message with both text and image
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt.prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{encoded_image}"
+                            }
+                        }
+                    ]
+                })
+            except Exception as e:
+                raise llm.ModelError(f"Error processing image: {str(e)}")
+        else:
+            # Standard text-only message
+            messages.append({"role": "user", "content": prompt.prompt})
+        
         return messages
 
     def set_usage(self, response, usage):
@@ -181,6 +264,22 @@ class Perplexity(llm.Model):
         response.set_usage(
             input=input_tokens, output=output_tokens, details=simplify_usage_dict(usage)
         )
+
+    @staticmethod
+    def format_citations(citations, prefix="\n\n## Citations:\n") -> str:
+        if not citations:
+            return ""
+        
+        formatted = prefix
+        for i, citation in enumerate(citations, 1):
+            if isinstance(citation, dict) and "url" in citation:
+                citation_text = citation["url"]
+                if "title" in citation:
+                    citation_text = f"{citation['title']} - {citation_text}"
+                formatted += f"[{i}] {citation_text}\n"
+            else:
+                formatted += f"[{i}] {citation}\n"
+        return formatted
 
     def execute(self, prompt, stream, response, conversation):
         if prompt.options.use_openrouter:
@@ -217,6 +316,20 @@ class Perplexity(llm.Model):
 
         if prompt.options.top_k:
             kwargs["top_k"] = prompt.options.top_k
+            
+        # Add search parameters for online models
+        if prompt.options.search_recency_filter and self.capabilities.get("web_search"):
+            kwargs["search_recency_filter"] = prompt.options.search_recency_filter
+            
+        if prompt.options.search_domain_filter and self.capabilities.get("web_search"):
+            # Validate non-empty domain filter
+            domains = [d.strip() for d in prompt.options.search_domain_filter.split(",") if d.strip()]
+            if domains:
+                kwargs["search_domain_filter"] = ",".join(domains)
+            
+        # Add options for return values
+        if prompt.options.return_related_questions:
+            kwargs["return_related_questions"] = prompt.options.return_related_questions
 
         if stream:
             completion = client.chat.completions.create(**kwargs)
@@ -239,9 +352,7 @@ class Perplexity(llm.Model):
             response.response_json = remove_dict_none_values(Perplexity.combine_chunks(chunks))
             
             if citations:
-                yield "\n\n## Citations:\n"
-                for i, citation in enumerate(citations, 1):
-                    yield f"[{i}] {citation}\n"
+                yield self.format_citations(citations)
 
         else:
             completion = client.chat.completions.create(**kwargs)
@@ -249,9 +360,7 @@ class Perplexity(llm.Model):
             usage = completion.usage.model_dump()
             yield completion.choices[0].message.content
             if hasattr(completion, "citations") and completion.citations:
-                yield "\n\n## Citations:\n"
-                for i, citation in enumerate(completion.citations, 1):
-                    yield f"[{i}] {citation}\n"
+                yield self.format_citations(completion.citations)
         self.set_usage(response, usage)
         response._prompt_json = {"messages": kwargs["messages"]}
 
